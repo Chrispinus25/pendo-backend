@@ -10,106 +10,117 @@ const io = new Server(server, {
   cors:{origin:'*',methods:['GET','POST']},
   pingTimeout:60000, pingInterval:25000,
 });
+
 app.use(cors());
 app.use(express.json());
 
 // Metered TURN credentials
 const METERED_DOMAIN = process.env.METERED_DOMAIN || 'pendochating.metered.live';
-const METERED_KEY    = process.env.METERED_KEY    || 'KSf_3n_VKRulFc1r61Udltc9CnryRDy8oviOkUAWFSkInwD0';
+const METERED_KEY    = process.env.METERED_KEY    || 'KSf_3n_VKRu1Fc1r61Ud1tc9CnryRDy8oviOkUAWF5kInwD0';
 
 let cachedIceServers = null;
 let iceServersFetchedAt = 0;
 
 async function getIceServers() {
   const now = Date.now();
-  // Cache for 1 hour
-  if (cachedIceServers && (now - iceServersFetchedAt) < 3600000) return cachedIceServers;
+  if (cachedIceServers && now - iceServersFetchedAt < 3600000) return cachedIceServers;
   try {
-    const url = `https://${METERED_DOMAIN}/api/v1/turn/credentials?apiKey=${METERED_KEY}`;
-    const res = await axios.get(url);
-    cachedIceServers = res.data;
+    const r = await axios.get(`https://${METERED_DOMAIN}/api/v1/turn/credentials?apiKey=${METERED_KEY}`);
+    cachedIceServers = r.data;
     iceServersFetchedAt = now;
-    console.log('✅ TURN credentials fetched:', cachedIceServers.length, 'servers');
     return cachedIceServers;
   } catch(e) {
-    console.error('❌ Failed to fetch TURN credentials:', e.message);
-    // Fallback to Google STUN only
-    return [{urls:'stun:stun.l.google.com:19302'}];
+    return [{ urls:'stun:stun.l.google.com:19302' }];
   }
 }
 
-app.get('/', (req,res) => res.json({status:'Pendo 🚀', online: io.engine.clientsCount}));
+app.get('/', (req, res) => res.send('ChatZap server is running ✅'));
+app.get('/online', (req, res) => res.json({ count: onlineCount }));
 
-// Endpoint for frontend to get ICE servers
-app.get('/ice-servers', async(req,res) => {
-  const servers = await getIceServers();
-  res.json(servers);
-});
-
-// M-Pesa
-const MPESA={CONSUMER_KEY:process.env.MPESA_CONSUMER_KEY||'',CONSUMER_SECRET:process.env.MPESA_CONSUMER_SECRET||'',SHORTCODE:process.env.MPESA_SHORTCODE||'174379',PASSKEY:process.env.MPESA_PASSKEY||'',CALLBACK_URL:process.env.MPESA_CALLBACK_URL||'',ENV:process.env.MPESA_ENV||'sandbox'};
-const MPESA_BASE=MPESA.ENV==='production'?'https://api.safaricom.co.ke':'https://sandbox.safaricom.co.ke';
-async function getMpesaToken(){const c=Buffer.from(`${MPESA.CONSUMER_KEY}:${MPESA.CONSUMER_SECRET}`).toString('base64');const r=await axios.get(`${MPESA_BASE}/oauth/v1/generate?grant_type=client_credentials`,{headers:{Authorization:`Basic ${c}`}});return r.data.access_token;}
-app.post('/mpesa/stkpush',async(req,res)=>{const{phone,amount,accountRef}=req.body;const p=phone.startsWith('0')?'254'+phone.slice(1):phone.replace('+','');const ts=new Date().toISOString().replace(/[-T:.Z]/g,'').slice(0,14);const pw=Buffer.from(`${MPESA.SHORTCODE}${MPESA.PASSKEY}${ts}`).toString('base64');try{const t=await getMpesaToken();const r=await axios.post(`${MPESA_BASE}/mpesa/stkpush/v1/processrequest`,{BusinessShortCode:MPESA.SHORTCODE,Password:pw,Timestamp:ts,TransactionType:'CustomerPayBillOnline',Amount:amount,PartyA:p,PartyB:MPESA.SHORTCODE,PhoneNumber:p,CallBackURL:MPESA.CALLBACK_URL,AccountReference:accountRef||'Pendo',TransactionDesc:'Pendo Premium'},{headers:{Authorization:`Bearer ${t}`}});res.json({success:true,data:r.data});}catch(e){res.status(500).json({success:false,error:e?.response?.data||e.message});}});
-app.post('/mpesa/callback',(req,res)=>{const r=req.body?.Body?.stkCallback;if(r?.ResultCode===0){const m=r.CallbackMetadata?.Item||[];console.log(`✅ KES ${m.find(i=>i.Name==='Amount')?.Value}`);}res.json({ResultCode:0,ResultDesc:'Accepted'});});
-
-// Users & matching
-const users = {};
+// ── ChatZap matchmaking state ──
 let waitingQueue = [];
-const activePairs = new Map();
+let activePairs  = {};
+let onlineCount  = 0;
 
-function broadcastAll(){
-  io.emit('online_count', io.engine.clientsCount);
-  io.emit('users_list', users);
+function isCompatible(a, b) {
+  const countryOk = !a.filters.country || !b.filters.country || a.filters.country === b.filters.country;
+  const genderOk  = !a.filters.pref || a.filters.pref === 'any' || a.filters.pref === b.filters.gender;
+  const reverseOk = !b.filters.pref || b.filters.pref === 'any' || b.filters.pref === a.filters.gender;
+  return countryOk && genderOk && reverseOk;
 }
 
-io.on('connection', socket => {
-  console.log(`🟢 ${socket.id} | total: ${io.engine.clientsCount}`);
+function findMatch(user) {
+  for (let i = 0; i < waitingQueue.length; i++) {
+    if (waitingQueue[i].id !== user.id && isCompatible(waitingQueue[i], user)) return i;
+  }
+  return -1;
+}
 
-  socket.on('find_match', async userData => {
-    const name = userData?.name || 'Anonymous';
-    socket.userData = {name};
-    users[socket.id] = {name};
-    broadcastAll();
+function removeFromQueue(id) {
+  waitingQueue = waitingQueue.filter(u => u.id !== id);
+}
 
-    waitingQueue = waitingQueue.filter(s => s.id !== socket.id);
-    const oldPartner = activePairs.get(socket.id);
-    if(oldPartner){ io.to(oldPartner).emit('partner_disconnected'); activePairs.delete(oldPartner); activePairs.delete(socket.id); }
+io.on('connection', (socket) => {
+  onlineCount++;
+  io.emit('online_count', onlineCount);
+  console.log(`[+] ${socket.id} | Online: ${onlineCount}`);
 
-    // Fetch fresh ICE servers for each match
-    const iceServers = await getIceServers();
+  // Send ICE servers on connect
+  getIceServers().then(ice => socket.emit('ice_servers', ice));
 
-    if(waitingQueue.length > 0){
-      const partner = waitingQueue.shift();
-      activePairs.set(socket.id, partner.id);
-      activePairs.set(partner.id, socket.id);
-      socket.emit('match_found',  {partnerId:partner.id, initiator:false, partnerData:partner.userData, iceServers});
-      partner.emit('match_found', {partnerId:socket.id,  initiator:true,  partnerData:socket.userData,  iceServers});
-      console.log(`💑 ${name} ↔ ${partner.userData?.name}`);
+  socket.on('find_match', (filters = {}) => {
+    if (activePairs[socket.id]) {
+      const p = activePairs[socket.id];
+      delete activePairs[p];
+      delete activePairs[socket.id];
+      io.to(p).emit('partner_left');
+    }
+    removeFromQueue(socket.id);
+
+    const user = { id: socket.id, filters: { country: filters.country||'', gender: filters.gender||'', pref: filters.pref||'any' }};
+    const idx = findMatch(user);
+
+    if (idx !== -1) {
+      const partner = waitingQueue[idx];
+      waitingQueue.splice(idx, 1);
+      activePairs[socket.id] = partner.id;
+      activePairs[partner.id] = socket.id;
+      socket.emit('matched', { partnerId: partner.id, role: 'caller' });
+      io.to(partner.id).emit('matched', { partnerId: socket.id, role: 'callee' });
+      console.log(`[✓] Matched: ${socket.id} ↔ ${partner.id}`);
     } else {
-      waitingQueue.push(socket);
-      socket.emit('waiting', {});
+      waitingQueue.push(user);
+      socket.emit('waiting');
+      console.log(`[~] Waiting: ${socket.id} | Queue: ${waitingQueue.length}`);
     }
   });
 
-  socket.on('offer',         d => { const p=activePairs.get(socket.id); if(p) io.to(p).emit('offer',        {sdp:d.sdp}); });
-  socket.on('answer',        d => { const p=activePairs.get(socket.id); if(p) io.to(p).emit('answer',       {sdp:d.sdp}); });
-  socket.on('ice_candidate', d => { const p=activePairs.get(socket.id); if(p) io.to(p).emit('ice_candidate',{candidate:d.candidate}); });
-  socket.on('video_message', d => { const p=activePairs.get(socket.id); if(p) io.to(p).emit('video_message',{text:d.text||d, name:socket.userData?.name}); });
+  socket.on('offer',         d => io.to(d.to).emit('offer',         { from: socket.id, sdp: d.sdp }));
+  socket.on('answer',        d => io.to(d.to).emit('answer',        { from: socket.id, sdp: d.sdp }));
+  socket.on('ice_candidate', d => io.to(d.to).emit('ice_candidate', { from: socket.id, candidate: d.candidate }));
+
+  socket.on('skip', () => {
+    const p = activePairs[socket.id];
+    if (p) { io.to(p).emit('partner_left'); delete activePairs[p]; delete activePairs[socket.id]; }
+    removeFromQueue(socket.id);
+    socket.emit('skipped');
+  });
+
+  socket.on('chat_message', msg => {
+    const p = activePairs[socket.id];
+    if (p) io.to(p).emit('chat_message', { text: msg.text, from: 'stranger' });
+  });
 
   socket.on('disconnect', () => {
-    console.log(`🔴 ${socket.id}`);
-    delete users[socket.id];
-    waitingQueue = waitingQueue.filter(s => s.id !== socket.id);
-    const partnerId = activePairs.get(socket.id);
-    if(partnerId){ io.to(partnerId).emit('partner_disconnected'); activePairs.delete(partnerId); }
-    activePairs.delete(socket.id);
-    setTimeout(broadcastAll, 300);
+    onlineCount = Math.max(0, onlineCount - 1);
+    io.emit('online_count', onlineCount);
+    const p = activePairs[socket.id];
+    if (p) { io.to(p).emit('partner_left'); delete activePairs[p]; }
+    delete activePairs[socket.id];
+    removeFromQueue(socket.id);
+    console.log(`[-] ${socket.id} | Online: ${onlineCount}`);
   });
 });
 
-// Pre-fetch TURN on startup
-getIceServers();
-
-const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => console.log(`🚀 Pendo on port ${PORT}`));
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`🚀 ChatZap running on port ${PORT}`));
